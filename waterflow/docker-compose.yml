@@ -1,0 +1,46 @@
+services:
+  waterflow:
+    build: .
+    container_name: waterflow
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      PRODUCT_NAME: "WaterFlow"
+      BUILDING_NAME: "L'Escalier Cabanas"
+      SUPER_ADMIN_APP_NAME: "WaterFlow Super Admin"
+      ADMIN_APP_NAME: "WaterFlow Admin"
+      TENANT_APP_NAME: "WaterFlow"
+
+      # Root credential — set this, it's how you log into /super the first time
+      SUPER_ADMIN_PASSWORD: "changeme"
+
+      # ChirpStack connection (this building's ChirpStack instance)
+      CHIRPSTACK_MQTT_HOST: "192.168.100.240"
+      CHIRPSTACK_MQTT_PORT: "1883"
+      CHIRPSTACK_MQTT_USER: ""
+      CHIRPSTACK_MQTT_PASS: ""
+      CHIRPSTACK_REST_URL: "http://192.168.100.240:8090"
+      CHIRPSTACK_API_KEY: ""
+      CHIRPSTACK_REGION: "EU868"
+      CHIRPSTACK_TENANT_NAME: "104 L'Escalier Cabanas"
+
+      DOMAIN_NAME: ""
+
+      ENABLE_HA_MQTT_DISCOVERY: "false"
+      HA_MQTT_HOST: "core-mosquitto"
+      HA_MQTT_PORT: "1883"
+      HA_MQTT_USER: ""
+      HA_MQTT_PASS: ""
+
+      SMTP_HOST: ""
+      SMTP_PORT: "587"
+      SMTP_USER: ""
+      SMTP_PASS: ""
+      SMTP_FROM: ""
+      TELEGRAM_BOT_TOKEN: ""
+      TELEGRAM_AUDIT_CHAT_ID: ""
+      TELEGRAM_DIGEST_CHAT_ID: ""
+      DIGEST_SEND_TIME: "08:00"

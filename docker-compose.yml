@@ -1,0 +1,23 @@
+services:
+  waterflow:
+    build: .
+    container_name: waterflow
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    # No secrets/settings here anymore - everything now lives in the
+    # database and is edited from the Super Admin PWA's Settings tab.
+    # First login: identifier "admin", password "admin" - change it
+    # immediately from Settings > Change My Password.
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: waterflow-cloudflared
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - waterflow

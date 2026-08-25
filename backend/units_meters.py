@@ -1,0 +1,233 @@
+from fastapi import HTTPException
+from database import get_conn
+from security import new_id
+from audit import log_action
+import chirpstack_client
+
+
+def list_units_with_meters(role_scope_unit_id=None):
+    with get_conn() as conn:
+        # GROUP_CONCAT + GROUP BY collapses multiple active tenants per unit into
+        # one display string instead of duplicating the whole unit row per tenant -
+        # matters once a unit legitimately has more than one active tenant account.
+        q = """
+            SELECT u.id as unit_id, u.unit_number, u.notes,
+                   m.id as meter_id, m.dev_eui, m.status as meter_status_col,
+                   ms.last_reading_m3, ms.last_reading_at, ms.battery_voltage,
+                   ms.battery_low, ms.valve_confirmed_state,
+                   GROUP_CONCAT(DISTINCT t.name) as tenant_names,
+                   bc.mode as billing_mode
+            FROM units u
+            LEFT JOIN meters m ON m.unit_id = u.id AND m.status = 'active'
+            LEFT JOIN meter_status ms ON ms.meter_id = m.id
+            LEFT JOIN users t ON t.unit_id = u.id AND t.role = 'tenant' AND t.active = 1
+            LEFT JOIN billing_config bc ON bc.unit_id = u.id
+        """
+        params = ()
+        if role_scope_unit_id:
+            q += " WHERE u.id = ?"
+            params = (role_scope_unit_id,)
+        q += " GROUP BY u.id ORDER BY u.unit_number"
+        rows = conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_unit_tenants(unit_id: str):
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, name, phone, email, active,
+                      password_hash IS NOT NULL as activated, created_at
+               FROM users WHERE unit_id=? AND role='tenant' ORDER BY created_at DESC""",
+            (unit_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_all_tenants():
+    """Flat, cross-unit tenant list (active and inactive) - the consolidated
+    view Super Admin/Admin see everyone from, instead of having to open each
+    unit individually to find one tenant."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT t.id, t.name, t.phone, t.email, t.active,
+                      t.password_hash IS NOT NULL as activated, t.created_at,
+                      t.unit_id, u.unit_number
+               FROM users t
+               LEFT JOIN units u ON u.id = t.unit_id
+               WHERE t.role='tenant'
+               ORDER BY t.active DESC, u.unit_number, t.created_at DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_unassigned_meters():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM meters WHERE status='unassigned' ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+
+def create_unit(actor, unit_number: str, notes: str = None):
+    uid = new_id()
+    with get_conn() as conn:
+        existing = conn.execute("SELECT id FROM units WHERE unit_number=?", (unit_number,)).fetchone()
+        if existing:
+            raise HTTPException(status_code=400, detail="Unit number already exists")
+        conn.execute("INSERT INTO units (id, unit_number, notes) VALUES (?, ?, ?)", (uid, unit_number, notes))
+        conn.execute(
+            "INSERT INTO billing_config (unit_id, mode, valve_target_state) VALUES (?, 'monthly', 'open')",
+            (uid,),
+        )
+        conn.commit()
+    log_action(actor, "unit_created", "unit", uid, after={"unit_number": unit_number})
+    return {"id": uid, "unit_number": unit_number}
+
+
+def update_unit(actor, unit_id: str, unit_number: str, notes: str = None):
+    with get_conn() as conn:
+        existing = conn.execute("SELECT * FROM units WHERE id=?", (unit_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Unit not found")
+        dup = conn.execute(
+            "SELECT id FROM units WHERE unit_number=? AND id!=?", (unit_number, unit_id)
+        ).fetchone()
+        if dup:
+            raise HTTPException(status_code=400, detail="Another unit already has that number")
+        conn.execute("UPDATE units SET unit_number=?, notes=? WHERE id=?", (unit_number, notes, unit_id))
+        conn.commit()
+    log_action(actor, "unit_updated", "unit", unit_id,
+               before={"unit_number": existing["unit_number"]}, after={"unit_number": unit_number})
+    return {"ok": True}
+
+
+def delete_unit(actor, unit_id: str):
+    """
+    Deliberately conservative: refuses to delete a unit that still has an
+    active meter or an active tenant attached, rather than silently orphaning
+    billing/reading history or leaving a tenant account pointing at nothing.
+    Admin must unassign the meter and remove/reassign the tenant first -
+    two explicit actions instead of one destructive one.
+    """
+    with get_conn() as conn:
+        unit = conn.execute("SELECT * FROM units WHERE id=?", (unit_id,)).fetchone()
+        if not unit:
+            raise HTTPException(status_code=404, detail="Unit not found")
+        active_meter = conn.execute(
+            "SELECT id FROM meters WHERE unit_id=? AND status='active'", (unit_id,)
+        ).fetchone()
+        if active_meter:
+            raise HTTPException(status_code=400, detail="Remove or reassign this unit's meter before deleting it")
+        active_tenant = conn.execute(
+            "SELECT id FROM users WHERE unit_id=? AND role='tenant' AND active=1", (unit_id,)
+        ).fetchone()
+        if active_tenant:
+            raise HTTPException(status_code=400, detail="This unit still has an active tenant account")
+
+        conn.execute("DELETE FROM billing_config WHERE unit_id=?", (unit_id,))
+        conn.execute("DELETE FROM units WHERE id=?", (unit_id,))
+        conn.commit()
+    log_action(actor, "unit_deleted", "unit", unit_id, before={"unit_number": unit["unit_number"]})
+    return {"ok": True}
+
+
+def add_meter(actor, dev_eui: str, app_key: str, unit_id: str = None) -> dict:
+    dev_eui = dev_eui.strip().upper()
+    with get_conn() as conn:
+        existing = conn.execute("SELECT id FROM meters WHERE dev_eui=?", (dev_eui,)).fetchone()
+        if existing:
+            raise HTTPException(status_code=400, detail="A meter with this DevEUI already exists")
+
+        device_name = f"Meter-{dev_eui[-6:]}"
+        if unit_id:
+            unit = conn.execute("SELECT unit_number FROM units WHERE id=?", (unit_id,)).fetchone()
+            if unit:
+                device_name = f"Unit-{unit['unit_number']}"
+
+    try:
+        chirpstack_client.create_device(dev_eui, device_name, app_key)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ChirpStack registration failed: {e}")
+
+    meter_id = new_id()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO meters (id, dev_eui, unit_id, chirpstack_device_name, status)
+               VALUES (?, ?, ?, ?, ?)""",
+            (meter_id, dev_eui, unit_id, device_name, "active" if unit_id else "unassigned"),
+        )
+        conn.execute("INSERT INTO meter_status (meter_id) VALUES (?)", (meter_id,))
+        conn.commit()
+
+    log_action(actor, "meter_added", "meter", meter_id, after={"dev_eui": dev_eui, "unit_id": unit_id})
+    return {"id": meter_id, "dev_eui": dev_eui}
+
+
+def assign_meter_to_unit(actor, meter_id: str, unit_id: str):
+    with get_conn() as conn:
+        meter = conn.execute("SELECT * FROM meters WHERE id=?", (meter_id,)).fetchone()
+        if not meter:
+            raise HTTPException(status_code=404, detail="Meter not found")
+        unit = conn.execute("SELECT unit_number FROM units WHERE id=?", (unit_id,)).fetchone()
+        new_name = f"Unit-{unit['unit_number']}" if unit else meter["chirpstack_device_name"]
+
+        conn.execute("UPDATE meters SET unit_id=?, status='active', chirpstack_device_name=? WHERE id=?",
+                     (unit_id, new_name, meter_id))
+        conn.commit()
+
+    if unit and new_name != meter["chirpstack_device_name"]:
+        try:
+            chirpstack_client.rename_device(meter["dev_eui"], new_name)
+        except Exception as e:
+            # Reassignment already succeeded locally - a rename failure on
+            # ChirpStack's side (e.g. transient network issue) shouldn't
+            # block the admin from using the meter, just leaves its
+            # ChirpStack-side label stale until the next successful rename.
+            log_action(actor, "chirpstack_rename_failed", "meter", meter_id, notes=str(e))
+
+    log_action(actor, "meter_assigned", "meter", meter_id,
+               before={"unit_id": meter["unit_id"]}, after={"unit_id": unit_id})
+
+
+def remove_meter(actor, meter_id: str):
+    with get_conn() as conn:
+        meter = conn.execute("SELECT * FROM meters WHERE id=?", (meter_id,)).fetchone()
+        if not meter:
+            raise HTTPException(status_code=404, detail="Meter not found")
+        try:
+            chirpstack_client.delete_device(meter["dev_eui"])
+        except Exception as e:
+            # Still remove locally even if ChirpStack delete fails (e.g. already gone) —
+            # log it so it's visible, don't block the admin from cleaning up their own records.
+            log_action(actor, "chirpstack_delete_failed", "meter", meter_id, notes=str(e))
+        conn.execute("UPDATE meters SET status='removed', unit_id=NULL WHERE id=?", (meter_id,))
+        conn.commit()
+    log_action(actor, "meter_removed", "meter", meter_id, before={"dev_eui": meter["dev_eui"]})
+
+
+def get_unit_for_tenant(tenant_unit_id: str):
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT u.*, m.id as meter_id, ms.last_reading_m3, ms.last_reading_at,
+                      ms.battery_voltage, ms.battery_low, ms.valve_confirmed_state,
+                      bc.mode, bc.balance_liters_remaining, bc.current_cycle_start_date,
+                      bc.current_cycle_start_reading_m3
+               FROM units u
+               LEFT JOIN meters m ON m.unit_id = u.id AND m.status='active'
+               LEFT JOIN meter_status ms ON ms.meter_id = m.id
+               LEFT JOIN billing_config bc ON bc.unit_id = u.id
+               WHERE u.id=?""",
+            (tenant_unit_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Unit not found")
+        result = dict(row)
+        # Monthly tenants see how much they've used since the cycle started,
+        # alongside the raw meter reading - prepaid tenants get balance
+        # remaining instead (computed where the top-up is recorded).
+        if (result["mode"] == "monthly" and result["current_cycle_start_reading_m3"] is not None
+                and result["last_reading_m3"] is not None):
+            result["used_this_cycle_liters"] = round(
+                max(result["last_reading_m3"] - result["current_cycle_start_reading_m3"], 0) * 1000, 1
+            )
+        else:
+            result["used_this_cycle_liters"] = None
+        return result
